@@ -21,24 +21,30 @@ An intelligent IT support ticket classification system powered by **local LLMs (
 ## 🏗 Architecture
 
 ```
-Ticket Text
-     │
-     ▼
-┌─────────────┐     ┌─────────────────────┐
-│  FastAPI    │────▶│  Ticket Classifier  │
-│  REST API   │     │  (LLM + Fallback)   │
-└─────────────┘     └─────────────────────┘
-     │                        │
-     │                ┌───────┴──────────┐
-     │                │  Ollama (Phi-3)  │
-     │                │  or Rule Engine  │
-     │                └──────────────────┘
-     ▼
-┌─────────────────┐
-│  Dashboard UI   │
-│  (Analytics)    │
-└─────────────────┘
+┌──────────────────────────────────────────────┐
+│           BROWSER (port 3001)                │
+│       index.html — Vanilla JS SPA            │
+│  User submits ticket → fetch() → REST API    │
+└──────────────────────┬───────────────────────┘
+                       │  HTTP (JSON)
+                       ▼
+┌──────────────────────────────────────────────┐
+│         FASTAPI SERVER (port 8001)           │
+│  api.py — Routes, validation, in-memory DB   │
+└──────────────────────┬───────────────────────┘
+                       │  Python function call
+                       ▼
+┌──────────────────────────────────────────────┐
+│          CLASSIFICATION ENGINE               │
+│  classifier.py — TicketClassifier            │
+│   ┌──────────────┐    ┌───────────────────┐  │
+│   │  LLM Path    │    │  Rule-Based Path  │  │
+│   │  Ollama/Phi3 │    │  Keyword matching │  │
+│   └──────────────┘    └───────────────────┘  │
+└──────────────────────────────────────────────┘
 ```
+
+For a full end-to-end walkthrough — including how FastAPI processes requests, how the LLM prompt is built, how the frontend fetches data, and how errors are handled — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ---
 
@@ -57,7 +63,7 @@ ollama pull phi3
 ## ⚙️ Setup
 
 ```bash
-git clone https://github.com/rezaaliyari/ai-ticket-classifier.git
+git clone https://github.com/AliyariGit/ai-ticket-classifier.git
 cd ai-ticket-classifier
 pip install -r backend/requirements.txt
 ```
