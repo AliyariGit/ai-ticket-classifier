@@ -11,3 +11,6 @@ node_modules/
 dist/
 *.egg-info/
 .pytest_cache/
+backend/artifacts/
+backend/training/data/
+backend/training/evaluation-results.json

@@ -4,16 +4,20 @@ Author: Reza (Ray) Aliyari
 Description: REST API for ticket classification with analytics
 """
 
-import json
-from datetime import datetime
 from collections import Counter
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
-from classifier import TicketClassifier
+load_dotenv()
+
+try:
+    from .classifier import TicketClassifier
+except ImportError:
+    from classifier import TicketClassifier
 
 app = FastAPI(
     title="AI Ticket Classifier API",
@@ -79,7 +83,7 @@ def classify_ticket(req: TicketRequest):
         classified_tickets.append(result)
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/classify/batch")

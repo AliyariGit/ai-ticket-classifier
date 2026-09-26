@@ -41,13 +41,14 @@ The application has three layers:
                        ▼
 ┌──────────────────────────────────────────────┐
 │          CLASSIFICATION ENGINE               │
-│  classifier.py — TicketClassifier class      │
-│                                              │
-│   ┌─────────────────┐  ┌──────────────────┐  │
-│   │  LLM Path       │  │  Fallback Path   │  │
-│   │  HTTP → Ollama  │  │  Keyword rules   │  │
-│   │  (phi3 model)   │  │  (no Ollama)     │  │
-│   └─────────────────┘  └──────────────────┘  │
+│  classifier.py — provider, prompt, parsing,  │
+│  validation, confidence fallback              │
+│  retrieval.py — optional local JSONL search  │
+│  llama_classifier.py — 4-bit base + PEFT     │
+│   ┌───────────┐ ┌──────────────┐ ┌─────────┐ │
+│   │ Ollama    │ │ QLoRA Llama  │ │ Rules   │ │
+│   │ Phi-3     │ │ 3.2 3B       │ │ fallback│ │
+│   └───────────┘ └──────────────┘ └─────────┘ │
 └──────────────────────────────────────────────┘
 ```
 
@@ -68,8 +69,13 @@ ai-ticket-classifier/
 │
 ├── backend/
 │   ├── api.py           ← FastAPI app: routes, request models, CORS, in-memory store
-│   ├── classifier.py    ← TicketClassifier: LLM + rule-based logic
-│   └── requirements.txt ← Python dependencies
+│   ├── classifier.py    ← provider selection, retrieval, prompt and output validation
+│   ├── retrieval.py     ← optional JSONL lexical retriever
+│   ├── llama_classifier.py ← 4-bit Llama inference + separately loaded PEFT adapter
+│   ├── training/        ← dataset preparation, QLoRA training and evaluation
+│   ├── tests/           ← GPU-free classifier and retrieval tests
+│   ├── requirements.txt ← base Python dependencies
+│   └── requirements-llama.txt ← optional Hugging Face/QLoRA dependencies
 │
 └── frontend/
     └── index.html       ← Single-page app: dashboard, charts, classification form
@@ -82,17 +88,18 @@ index.html
   └── fetch("http://localhost:8001/classify")
         └── api.py → POST /classify
               └── classifier.classify(text)
-                    ├── _classify_with_llm()
-                    │     └── HTTP POST → Ollama (localhost:11434)
-                    └── _classify_rule_based()
-                          └── keyword matching (pure Python)
+              ├── retrieval.py → relevant local JSONL context (optional)
+              ├── Ollama provider → HTTP POST (localhost:11434)
+              ├── Llama provider → 4-bit base + separate LoRA adapter
+              ├── validate category, fields, confidence and output bounds
+              └── keyword rules on errors or low confidence
 ```
 
 ---
 
 ## 3. Server Startup Sequence
 
-When you run `uvicorn api:app --port 8001`, here is what happens in order:
+When you run `uvicorn api:app --port 8001` from `backend/`, here is what happens in order:
 
 ```
 Step 1 — FastAPI app object created (api.py line 16)
@@ -101,28 +108,25 @@ Step 1 — FastAPI app object created (api.py line 16)
 Step 2 — CORS middleware registered (api.py lines 22–28)
           Allows the frontend (any origin) to call the API
 
-Step 3 — TicketClassifier instantiated (api.py line 31)
-          classifier = TicketClassifier()
+Step 3 — Environment loaded and TicketClassifier instantiated
+          LLM_PROVIDER selects ollama (default), llama, or rules
+          CLASSIFICATION_CONFIDENCE_THRESHOLD defaults to 0.80
+          RAG_DATA_PATH optionally loads local JSONL reference documents
 
-          Inside __init__ (classifier.py lines 68–75):
-            self.model = "phi3"
-            self.ollama_url = "http://localhost:11434"
-            self.use_llm = True
-            self._check_ollama()   ← health check
+Step 4 — Provider initialization
+          ollama → GET /api/tags; unavailable Ollama selects rule fallback
+          llama  → require adapter path, CUDA GPU and optional ML packages;
+                   load 4-bit base model and separate frozen PEFT adapter
+          rules  → skip model initialization
 
-Step 4 — _check_ollama() probes Ollama (classifier.py lines 77–86)
-          GET http://localhost:11434/api/tags (timeout=3s)
+Step 5 — @app.on_event("startup") seeds 8 demo tickets
+          Each ticket passes through retrieval, the selected provider,
+          output validation and confidence fallback; results are stored
+          in the existing in-memory list.
 
-          ┌─ Ollama running ──→ log "Ollama connected", use_llm stays True
-          └─ Ollama missing ──→ log warning, self.use_llm = False
-
-Step 5 — @app.on_event("startup") fires (api.py lines 43–47)
-          Loops over 8 hardcoded demo tickets
-          Calls classifier.classify() for each
-          Appends results to classified_tickets list
-
-Step 6 — Uvicorn starts listening on 0.0.0.0:8001
-          API is ready
+Step 6 — Uvicorn listens on 0.0.0.0:8001
+          Explicitly selecting llama without its runtime requirements
+          raises a startup error instead of attempting CPU quantized load.
 ```
 
 After startup the in-memory list already contains 8 pre-classified demo tickets, so the dashboard has data to show immediately.
@@ -166,28 +170,24 @@ POST /classify route receives the request
 classify() method:
 
     │
-    │  Check self.use_llm
-    │
-    ├─ True ──→ _classify_with_llm(ticket_text)
-    │               │
-    │               │  Build prompt with PROMPT_TEMPLATE
-    │               │  POST http://localhost:11434/api/generate
-    │               │    body: { model: "phi3", prompt: "...", stream: false }
-    │               │  Wait up to 60 seconds for response
-    │               │  Extract JSON from response text with regex
-    │               │  Return parsed dict
-    │               │
-    └─ False ─→ _classify_rule_based(ticket_text)
-                    │
-                    │  Scan text.lower() for keyword lists
-                    │  Assign category, priority, sentiment
-                    │  Return dict with confidence=0.65
+     │  Retrieve up to RAG_TOP_K matching JSONL documents (optional)
+     │  Treat ticket and context as untrusted data in separate prompt blocks
+     │
+     ├─ LLM_PROVIDER=ollama ─→ HTTP POST to Ollama (Phi-3 by default)
+     ├─ LLM_PROVIDER=llama  ─→ 4-bit Llama 3.2 3B + separate PEFT adapter
+     └─ LLM_PROVIDER=rules  ─→ keyword rules
+     │
+     │  Parse bounded JSON and validate all existing enum fields,
+     │  confidence range, string lengths and keyword count
+     │
+     └─ Invalid output, provider error, retrieval failure or confidence
+         below threshold → continue without context or use rule fallback
     │
     │  Enrich result (both paths):
     │    result["ticket_id"]    = "TKT-20260611103000"
     │    result["classified_at"] = "2026-06-11T10:30:00"
     │    result["ticket_text"]  = first 300 chars
-    │    result["method"]       = "LLM" or "Rule-Based"
+    │    result["method"]       = "LLM", "QLoRA Llama" or "Rule-Based"
     │
     ▼
 
@@ -282,56 +282,51 @@ FastAPI uses this model to parse and validate the JSON body. If `text` is missin
 
 ## 6. Classification Engine — LLM Path
 
-When Ollama is available (`self.use_llm = True`), `_classify_with_llm()` runs:
+When Ollama or the Llama provider is selected, the classifier builds the same task prompt and validates the model output:
 
 ```
 1. Build the prompt
    ─────────────────
    PROMPT_TEMPLATE is filled with:
-   - The ticket text (truncated to 1500 chars)
-   - The list of valid categories
+    - Ticket text (truncated to 1500 characters and escaped as untrusted input)
+    - Up to 6000 characters of retrieved local reference context
+    - Existing category, priority, and sentiment enums
 
    The prompt instructs the model to return ONLY a JSON object with
    these fields: category, priority, sentiment, summary,
    suggested_action, confidence, keywords
 
-2. Send to Ollama
-   ──────────────
-   POST http://localhost:11434/api/generate
-   Body:
-   {
-     "model": "phi3",
-     "prompt": "<full prompt text>",
-     "stream": false        ← wait for complete response, no streaming
-   }
-   Timeout: 60 seconds
+2. Generate a response
+     ────────────────────
+     Ollama → POST /api/generate, default model `phi3`, timeout 60 seconds
+     Llama  → CUDA inference with a 4-bit NF4 base and separately loaded
+                        frozen PEFT adapter; at most 300 new tokens
 
 3. Parse the response
    ──────────────────
    Ollama returns:
    { "response": "...JSON object here..." }
 
-   Because the model sometimes wraps JSON in markdown fences or adds
-   explanatory text, a regex extracts just the JSON:
-     re.search(r'\{.*\}', raw, re.DOTALL)
+     The parser accepts one bounded JSON object, then validates the existing
+     category, priority, and sentiment enums; confidence must be finite and
+     between 0 and 1; text and keyword lengths are capped.
 
-   json.loads() parses the extracted string into a Python dict.
-
-4. Fallback on error
-   ──────────────────
-   If the regex finds no JSON, or json.loads() raises an exception,
-   or the HTTP request times out → _classify_rule_based() is called
-   as a second-chance fallback.
+4. Fallback and confidence gate
+    ────────────────────────────
+    Retrieval failure means empty context. Provider errors, malformed or
+    invalid output, and confidence below CLASSIFICATION_CONFIDENCE_THRESHOLD
+    use the existing keyword-rule classifier. The default threshold is 0.80.
 ```
 
 **Why Phi-3?**
 Phi-3 is a small (3.8B parameter) Microsoft model that runs well on CPU. It follows instruction prompts reliably and returns structured JSON consistently, making it well-suited for this classification task without requiring a GPU.
+The Llama provider requires a supported CUDA GPU and an adapter directory. It fails clearly during application initialization when those requirements are unavailable; it does not silently attempt CPU quantized inference. Select Ollama or rules explicitly for a fallback provider.
 
 ---
 
 ## 7. Classification Engine — Rule-Based Fallback
 
-When Ollama is not available, `_classify_rule_based()` applies keyword matching:
+When Ollama is not available, a model request fails, output is invalid, or confidence is below threshold, `classify_rule_based()` applies keyword matching:
 
 ```
 Input: ticket text (lowercased)
@@ -526,7 +521,7 @@ def get_analytics():
 | `category` | `Hardware Issue`, `Software Bug`, `Network & Connectivity`, `Access & Permissions`, `Performance Issue`, `Security Incident`, `Data Loss / Backup`, `Feature Request`, `General Inquiry`, `Other` |
 | `priority` | `Critical`, `High`, `Medium`, `Low` |
 | `sentiment` | `Frustrated`, `Neutral`, `Satisfied` |
-| `method` | `LLM`, `Rule-Based` |
+| `method` | `LLM`, `QLoRA Llama`, `Rule-Based` |
 
 ### Response — GET /analytics
 
@@ -546,31 +541,17 @@ def get_analytics():
 
 ## 11. Error Handling & Fallback Strategy
 
-The system has two layers of fault tolerance:
+The system keeps the existing rule-based fallback and adds retrieval and model-output guards:
 
-### Layer 1 — Ollama unavailability (startup)
+### Provider initialization
 
-`_check_ollama()` runs once at startup. If the `GET /api/tags` request fails or returns a non-200 status, `self.use_llm` is set to `False`. Every subsequent `classify()` call skips the LLM path entirely and goes straight to rule-based.
+If Ollama is unavailable during startup, classification uses the rules provider. If Llama is explicitly selected but CUDA, the adapter, or optional dependencies are unavailable, initialization raises a clear error instead of silently loading on CPU.
 
-### Layer 2 — LLM response parsing errors (per request)
+### Per-request behavior
 
-Even when Ollama is running, the LLM may return malformed JSON, or the request may time out. `_classify_with_llm()` wraps the entire Ollama call in a `try/except`:
+Retrieval exceptions continue with empty context. Model errors, malformed JSON, invalid enum values, invalid confidence, overlong output, or confidence below the configured threshold use the rule-based classifier. The API response shape remains unchanged.
 
-```python
-try:
-    response = requests.post(ollama_url, json=payload, timeout=60)
-    response.raise_for_status()
-    json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if json_match:
-        return json.loads(json_match.group())
-    else:
-        return self._classify_rule_based(ticket_text)   # ← fallback
-except Exception as e:
-    logger.error(f"LLM error: {e}")
-    return self._classify_rule_based(ticket_text)       # ← fallback
-```
-
-This means a ticket classification request **never fails due to Ollama issues** — it always returns a result.
+Ticket text and retrieved documents are bounded and escaped before being placed in separate prompt data blocks. The prompt directs the model to treat both as untrusted reference data. This is defense in depth, not a guarantee that prompt injection is impossible.
 
 ### FastAPI error responses
 

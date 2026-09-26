@@ -1,0 +1,7 @@
+# Install a PyTorch build matching the machine's CUDA runtime first, per pytorch.org.
+transformers>=4.45,<5
+peft>=0.13,<1
+bitsandbytes>=0.44
+accelerate>=1.0
+datasets>=3.0
+trl>=0.24,<1

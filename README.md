@@ -1,6 +1,6 @@
 # 🎫 AI Ticket Classifier
 
-An intelligent IT support ticket classification system powered by **local LLMs (Ollama/Phi-3)** with NLM-based categorization, priority scoring, sentiment analysis, and a real-time analytics dashboard.
+An IT support ticket classification system powered by local LLMs, with priority scoring, sentiment analysis, rule-based fallback, and a real-time analytics dashboard. The optional provider is a QLoRA adapter on 4-bit Llama 3.2 3B, with local knowledge retrieval.
 
 ![Dashboard Preview](docs/demo.gif)
 
@@ -8,7 +8,8 @@ An intelligent IT support ticket classification system powered by **local LLMs (
 
 ## 🚀 Features
 
-- 🤖 **LLM Classification** — Phi-3 via Ollama for intelligent ticket analysis
+- 🤖 **LLM Classification** — Phi-3 via Ollama by default, or optional QLoRA Llama 3.2 3B
+- 📚 **Local retrieval** — optionally provide relevant knowledge from a JSONL file
 - 🔄 **Rule-based fallback** — works even without Ollama running
 - 📊 **Real-time dashboard** — live analytics with category/priority/sentiment breakdown
 - 🚨 **Priority scoring** — Critical / High / Medium / Low with SLA guidance
@@ -36,11 +37,13 @@ An intelligent IT support ticket classification system powered by **local LLMs (
                        ▼
 ┌──────────────────────────────────────────────┐
 │          CLASSIFICATION ENGINE               │
-│  classifier.py — TicketClassifier            │
-│   ┌──────────────┐    ┌───────────────────┐  │
-│   │  LLM Path    │    │  Rule-Based Path  │  │
-│   │  Ollama/Phi3 │    │  Keyword matching │  │
-│   └──────────────┘    └───────────────────┘  │
+│  classifier.py — provider selection,        │
+│  context retrieval, validation, fallback     │
+│   ┌───────────┐ ┌──────────────┐ ┌─────────┐ │
+│   │ Ollama    │ │ 4-bit Llama  │ │ Rules   │ │
+│   │ Phi-3     │ │ + LoRA       │ │ fallback│ │
+│   └───────────┘ └──────────────┘ └─────────┘ │
+│  retrieval.py — optional local JSONL search  │
 └──────────────────────────────────────────────┘
 ```
 
@@ -51,10 +54,11 @@ For a full end-to-end walkthrough — including how FastAPI processes requests, 
 ## 📋 Prerequisites
 
 - Python 3.10+
-- [Ollama](https://ollama.ai) *(optional — falls back to rule-based)*
+- [Ollama](https://ollama.ai) *(optional; current default provider)*
+- CUDA-capable NVIDIA GPU and compatible PyTorch/CUDA/BitsAndBytes stack *(only for Llama training/inference)*
 
 ```bash
-# Optional: pull LLM model for AI-powered classification
+# Optional default provider: pull Ollama model
 ollama pull phi3
 ```
 
@@ -68,12 +72,22 @@ cd ai-ticket-classifier
 pip install -r backend/requirements.txt
 ```
 
+The base install intentionally does not install GPU libraries. To use or train the Llama adapter, install a PyTorch build for your CUDA runtime using the [official PyTorch selector](https://pytorch.org/get-started/locally/), then install the optional stack:
+
+```bash
+pip install -r backend/requirements-llama.txt
+```
+
+Llama 3.2 access may require accepting Meta's model license and authenticating with Hugging Face. CUDA/Linux is the recommended setup; BitsAndBytes support varies by platform.
+
 ### Start the API
 
 ```bash
 cd backend
 uvicorn api:app --reload --port 8001
 ```
+
+Set `LLM_PROVIDER=ollama` (default), `LLM_PROVIDER=llama`, or `LLM_PROVIDER=rules` in the environment. For Llama, copy `backend/.env.example` to `backend/.env` and set `LLAMA_ADAPTER_PATH` to the trained adapter directory. An explicitly selected Llama provider fails clearly at startup if the adapter, CUDA GPU, or runtime dependencies are unavailable; select Ollama or rules as the fallback provider.
 
 ### Open the Dashboard
 
@@ -147,9 +161,48 @@ curl -X POST http://localhost:8001/classify/batch \
 | Layer | Technology |
 |-------|-----------|
 | LLM | Ollama (Phi-3) |
+| Optional model | 4-bit Llama 3.2 3B + PEFT LoRA adapter |
+| Optional retrieval | Local lexical search over JSONL knowledge documents |
 | Fallback | Keyword rule engine |
 | API | FastAPI |
 | Frontend | Vanilla JS / HTML / CSS |
+
+## QLoRA Training and Retrieval
+
+The existing IT categories and response contract stay authoritative. Llama returns the same category, priority, sentiment, summary, action, confidence, and keyword fields consumed by the dashboard. Malformed outputs, model errors, retrieval errors, and confidence below `CLASSIFICATION_CONFIDENCE_THRESHOLD` use the existing rule-based fallback. This project currently has no human-review queue.
+
+The optional local retriever reads one JSON object per line from `RAG_DATA_PATH`, with `title` and either `content` or `text` fields. It ranks documents by lexical overlap and includes up to `RAG_TOP_K` entries. This is a small local retrieval implementation, not a vector database. Ticket and retrieved text are bounded and escaped in the prompt; retrieved documents are explicitly treated as untrusted reference data.
+
+### Data format and training
+
+Create a JSONL file with one labeled ticket per line. Prefer `group_id`, `thread_id`, or `customer_id` so related tickets stay in one split; exact duplicate normalized ticket text is grouped when no identifier is provided.
+
+```json
+{"ticket":"VPN authentication fails after a password reset.","context":"VPN policy: authentication failures should be checked with the access team.","answer":{"category":"Access & Permissions","priority":"High","sentiment":"Neutral","summary":"The customer cannot authenticate to the VPN after a password reset.","suggested_action":"Route to the access team and verify the account state.","confidence":0.9,"keywords":["VPN","authentication"]},"group_id":"customer-42"}
+```
+
+Use only the application's existing category values shown in the API schema above. For example, this project does not define a separate `BILLING` category.
+
+```bash
+python -m backend.training.prepare_dataset tickets.jsonl --output-dir backend/training/data
+python -m backend.training.train_qlora --data-dir backend/training/data --output-dir backend/artifacts/llama-ticket-adapter
+```
+
+Preparation deterministically assigns distinct ticket/customer/thread groups to train, validation, and test. Training consumes train and validation only; the evaluation script consumes the held-out test file. Use enough independent groups and inspect the split sizes before training. Large datasets with semantic near-duplicates should be grouped upstream by customer/thread/time because text normalization only catches exact normalized duplicates.
+
+LoRA defaults are `LORA_R=32`, `LORA_ALPHA=64`, `LORA_DROPOUT=0.05`, and `TARGET_MODULES=q_proj,k_proj,v_proj,o_proj`. These are starting points, not tuned values. With a sufficiently large, diverse dataset, compare ranks and consider MLP modules such as `gate_proj,up_proj,down_proj`; evaluate each change on the same held-out test set.
+
+### Inference and evaluation
+
+```bash
+# From the repository root; prepare backend/.env with LLM_PROVIDER=llama and adapter path.
+uvicorn backend.api:app --reload --port 8001
+python -m backend.training.evaluate --test backend/training/data/test.jsonl --output backend/training/evaluation-results.json
+```
+
+The comparison reports the rule baseline, QLoRA without retrieval, and QLoRA with retrieval: accuracy, macro/per-class precision, recall and F1, confusion matrix, invalid JSON rate, mean latency, Brier score, and expected calibration error. Confidence metrics are diagnostics, not proof of calibration; use a sufficiently large representative test set and calibrate thresholds against actual review outcomes. Results are not included in this repository, and no training or evaluation run is claimed here.
+
+QLoRA teaches task behavior, category boundaries, output structure, and terminology. Retrieval supplies current or changing policies and knowledge; do not train frequently changing company facts into the adapter.
 
 ---
 
